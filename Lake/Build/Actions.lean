@@ -43,16 +43,22 @@ def compileOlean (leanFile oleanFile : FilePath)
 def compileOleanAndC (leanFile oleanFile cFile : FilePath)
 (oleanPath : SearchPath := []) (rootDir : FilePath := ".")
 (leanArgs : Array String := #[]) (lean : FilePath := "lean")
+(precompiledPath : SearchPath := ∅)
 : BuildM PUnit := do
   createParentDirs cFile
   createParentDirs oleanFile
+  let mut env := #[("LEAN_PATH", some oleanPath.toString)]
+  if System.Platform.isWindows then
+    let path := (← IO.getEnv "PATH").getD ""
+    -- set up search path for locating dependent DLLs
+    env := env ++ #[("PATH", some (SearchPath.parse path ++ precompiledPath).toString)]
   proc {
     cmd := lean.toString
     args := leanArgs ++ #[
       "-R", rootDir.toString, "-o", oleanFile.toString, "-c",
       cFile.toString, leanFile.toString
     ]
-    env := #[("LEAN_PATH", oleanPath.toString)]
+    env
   }
 
 def compileO (oFile srcFile : FilePath)

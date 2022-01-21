@@ -112,9 +112,9 @@ def moduleTarget
 def moduleOleanAndCTarget
 (leanFile cFile oleanFile traceFile : FilePath)
 (contents : String)  (depTarget : BuildTarget x)
-(rootDir : FilePath := ".") (leanArgs : Array String := #[]) : OleanAndCTarget :=
+(rootDir : FilePath := ".") (leanArgs : Array String := #[]) (precompiledPath : SearchPath := ∅) : OleanAndCTarget :=
   moduleTarget (OleanAndC.mk oleanFile cFile) leanFile traceFile contents depTarget do
-    compileOleanAndC leanFile oleanFile cFile (← getOleanPath) rootDir leanArgs (← getLean)
+    compileOleanAndC leanFile oleanFile cFile (← getOleanPath) rootDir leanArgs (← getLean) precompiledPath
 
 def moduleOleanTarget
 (leanFile oleanFile traceFile : FilePath)
@@ -131,8 +131,10 @@ protected def Package.moduleOleanAndCTargetOnly (self : Package)
   let oleanFile := self.modToOlean mod
   let traceFile := self.modToTraceFile mod
   let args := self.moreLeanArgs ++ loadLibs.map (s!"--load-dynlib={·}")
+  -- TODO: extend with dependent packages when implementing `precompilePackage`
+  let precompiledPath := [self.irDir]
   moduleOleanAndCTarget leanFile cFile oleanFile traceFile contents
-    depTarget self.rootDir args
+    depTarget self.rootDir args precompiledPath
 
 protected def Package.moduleOleanTargetOnly (self : Package)
 (mod : Name) (leanFile : FilePath) (contents : String) (depTarget : BuildTarget x) :=
