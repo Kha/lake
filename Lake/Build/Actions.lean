@@ -48,7 +48,7 @@ def compileOleanAndC (leanFile oleanFile cFile : FilePath)
   createParentDirs cFile
   createParentDirs oleanFile
   let mut env := #[("LEAN_PATH", some oleanPath.toString)]
-  if System.Platform.isWindows then
+  if !precompiledPath.isEmpty && System.Platform.isWindows then
     let path := (← IO.getEnv "PATH").getD ""
     -- set up search path for locating dependent DLLs
     env := env ++ #[("PATH", some (SearchPath.parse path ++ precompiledPath).toString)]
