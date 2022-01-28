@@ -152,17 +152,25 @@ structure ModuleInfo where
 def ModuleInfo.srcFile (self : ModuleInfo) : FilePath :=
   self.pkg.modToSrc self.name
 
+abbrev ModuleBuildM (α) :=
+  -- equivalent to `RBTopT (cmp := Name.quickCmp) Name α BuildM`.
+  -- phrased this way to use `NameMap`
+  EStateT (List Name) (NameMap α) BuildM
+
+abbrev RecModuleBuild (o) :=
+  RecBuild ModuleInfo o (ModuleBuildM o)
+
+abbrev RecModuleTargetBuild (i) :=
+  RecModuleBuild (ActiveBuildTarget i)
+
 /-
 Produces a recursive module target builder that
 builds the target module after recursively building its local imports
 (relative to the workspace).
 -/
 def recBuildModuleWithLocalImports
-[Monad m] [MonadLiftT BuildM m] [MonadFunctorT BuildM m]
-(build : Package → Name → FilePath → String → List α → BuildM α)
-: RecBuild ModuleInfo α m := fun info recurse => do
-  have : MonadLift BuildM m := ⟨liftM⟩
-  have : MonadFunctor BuildM m := ⟨fun f => monadMap (m := BuildM) f⟩
+(build : Package → Name → FilePath → String → List o → BuildM o)
+: RecModuleBuild o := fun info recurse => do
   let contents ← IO.FS.readFile info.srcFile
   let (imports, _, _) ← Elab.parseImports contents info.srcFile.toString
   -- we construct the import targets even if a rebuild is not required
@@ -180,9 +188,8 @@ structure ActivePrecompModuleTargets extends ActiveOleanAndCTargets where
   allLoadLibs : Std.RBTree String compare
 deriving Inhabited
 
-def recBuildModulePrecompTargetWithLocalImports
-[Monad m] [MonadLiftT BuildM m] [MonadFunctorT BuildM m] (depTarget : ActiveBuildTarget x)
-: RecBuild ModuleInfo (ActiveBuildTarget ActivePrecompModuleTargets) m :=
+def recBuildModulePrecompTargetWithLocalImports (depTarget : ActiveBuildTarget x)
+: RecModuleBuild (ActiveBuildTarget ActivePrecompModuleTargets) :=
   recBuildModuleWithLocalImports fun pkg mod leanFile contents importTargets => do
     let importSharedLibTargets := importTargets.map (·.info.sharedLibTarget)
     let importTarget ← ActiveTarget.collectOpaqueList <| importTargets.map (·.info.oleanTarget) ++ importSharedLibTargets
@@ -212,34 +219,19 @@ def recBuildModulePrecompTargetWithLocalImports
     let allLoadLibs := moreLoadLibs.union loadLibs
     return sharedLibTarget.withInfo { oleanAndC.info with mod, sharedLibTarget, allLoadLibs }
 
-def recBuildModuleOleanAndCTargetWithLocalImports
-[Monad m] [MonadLiftT BuildM m] [MonadFunctorT BuildM m] (depTarget : ActiveBuildTarget x)
-: RecBuild ModuleInfo ActiveOleanAndCTarget m :=
+def recBuildModuleOleanAndCTargetWithLocalImports (depTarget : ActiveBuildTarget x)
+: RecModuleBuild ActiveOleanAndCTarget :=
   recBuildModuleWithLocalImports fun pkg mod leanFile contents importTargets => do
     let importTarget ← ActiveTarget.collectOpaqueList <| importTargets.map (·.oleanTarget)
     let allDepsTarget := Target.active <| ← depTarget.mixOpaqueAsync importTarget
     pkg.moduleOleanAndCTargetOnly mod leanFile contents #[] [] allDepsTarget |>.activate
 
-def recBuildModuleOleanTargetWithLocalImports
-[Monad m] [MonadLiftT BuildM m] [MonadFunctorT BuildM m] (depTarget : ActiveBuildTarget x)
-: RecBuild ModuleInfo ActiveFileTarget m :=
+def recBuildModuleOleanTargetWithLocalImports (depTarget : ActiveBuildTarget x)
+: RecModuleBuild ActiveFileTarget :=
   recBuildModuleWithLocalImports fun pkg mod leanFile contents importTargets => do
     let importTarget ← ActiveTarget.collectOpaqueList importTargets
     let allDepsTarget := Target.active <| ← depTarget.mixOpaqueAsync importTarget
     pkg.moduleOleanTargetOnly mod leanFile contents allDepsTarget |>.activate
-
--- ## Definitions
-
-abbrev ModuleBuildM (α) :=
-  -- equivalent to `RBTopT (cmp := Name.quickCmp) Name α BuildM`.
-  -- phrased this way to use `NameMap`
-  EStateT (List Name) (NameMap α) BuildM
-
-abbrev RecModuleBuild (o) :=
-  RecBuild ModuleInfo o (ModuleBuildM o)
-
-abbrev RecModuleTargetBuild (i) :=
-  RecModuleBuild (ActiveBuildTarget i)
 
 -- ## Builders
 
