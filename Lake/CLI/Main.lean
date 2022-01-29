@@ -211,8 +211,8 @@ def printPaths (imports : List String := []) : CliStateM PUnit := do
   if (← configFile.pathExists) then
     let (ws, pkg) ← loadConfig (← getSubArgs)
     let ctx ← mkBuildContext ws lean lake
-    pkg.buildImportsAndDeps imports |>.run LogMethods.eio ctx
-    IO.println <| Json.compress <| toJson ws.leanPaths
+    let loadDynlibPaths ← pkg.buildImportsAndDeps imports |>.run LogMethods.eio ctx
+    IO.println <| Json.compress <| toJson { ws.leanPaths with loadDynlibPaths }
   else
     exit noConfigFileCode
 
