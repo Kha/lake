@@ -152,16 +152,34 @@ structure ModuleInfo where
 def ModuleInfo.srcFile (self : ModuleInfo) : FilePath :=
   self.pkg.modToSrc self.name
 
+structure ModuleBuildCfg where
+  buildSharedLibs : Bool := false
+
 abbrev ModuleBuildM (α) :=
-  -- equivalent to `RBTopT (cmp := Name.quickCmp) Name α BuildM`.
+  -- equivalent to `ReaderT ModuleBuildCfg <| RBTopT (cmp := Name.quickCmp) Name α BuildM`.
   -- phrased this way to use `NameMap`
-  EStateT (List Name) (NameMap α) BuildM
+  EStateT (List Name) (NameMap α) <| ReaderT ModuleBuildCfg BuildM
 
-abbrev RecModuleBuild (o) :=
-  RecBuild ModuleInfo o (ModuleBuildM o)
+-- NOTE: `buildC` should be considered a *request* from external users.
+-- C files may be built regardless because of precompilation, but this fact is opaque to the caller.
+structure ActiveModuleTargets (buildC : Bool) where
+  mod : Name
+  leanOutputTarget : if buildC then ActiveOleanAndCTarget else ActiveFileTarget
+  sharedLibTarget? : Option ActiveFileTarget := none
+  -- NOTE: used only on Windows
+  allLoadLibs : Std.RBTree String compare := ∅
 
-abbrev RecModuleTargetBuild (i) :=
-  RecModuleBuild (ActiveBuildTarget i)
+instance (buildC) : Inhabited (ActiveModuleTargets buildC) where
+  default := {
+    mod := default
+    leanOutputTarget := match (generalizing := true) buildC with
+      | false => (default : ActiveFileTarget)
+      | true  => (default : ActiveOleanAndCTarget)
+  }
+
+abbrev ActiveModuleTarget (buildC : Bool) := ActiveBuildTarget (ActiveModuleTargets buildC)
+
+abbrev RecModuleBuild (buildC : Bool) := RecBuild ModuleInfo (ActiveModuleTarget buildC) (ModuleBuildM (ActiveModuleTarget buildC))
 
 /-
 Produces a recursive module target builder that
@@ -169,76 +187,78 @@ builds the target module after recursively building its local imports
 (relative to the workspace).
 -/
 def recBuildModuleWithLocalImports
-(build : Package → Name → FilePath → String → List o → BuildM o)
-: RecModuleBuild o := fun info recurse => do
+(build : Package → Name → FilePath → String → ModuleBuildM o (List o) → ModuleBuildM o o)
+: RecBuild ModuleInfo o (ModuleBuildM o) := fun info recurse => do
   let contents ← IO.FS.readFile info.srcFile
   let (imports, _, _) ← Elab.parseImports contents info.srcFile.toString
   -- we construct the import targets even if a rebuild is not required
   -- because other build processes (ex. `.o`) rely on the map being complete
-  let importTargets ← imports.filterMapM fun imp => OptionT.run do
+  let importTargets : ModuleBuildM o _ := imports.filterMapM fun imp => OptionT.run do
     let mod := imp.module
     let pkg ← OptionT.mk <| getPackageForModule? mod
     recurse ⟨pkg, mod⟩
   build info.pkg info.name info.srcFile contents importTargets
 
-structure ActivePrecompModuleTargets extends ActiveOleanAndCTargets where
-  mod : Name
-  sharedLibTarget : ActiveFileTarget
-  -- NOTE: used only on Windows
-  allLoadLibs : Std.RBTree String compare
-deriving Inhabited
+variable {buildC : Bool}
 
-def recBuildModulePrecompTargetWithLocalImports (depTarget : ActiveBuildTarget x)
-: RecModuleBuild (ActiveBuildTarget ActivePrecompModuleTargets) :=
+def ActiveModuleTargets.oleanTarget (self : ActiveModuleTargets buildC) : ActiveFileTarget :=
+  match (generalizing := true) buildC with
+  | true  => self.leanOutputTarget.oleanTarget
+  | false => self.leanOutputTarget
+
+def recBuildModuleTargetsWithLocalImports (depTarget : ActiveBuildTarget x)
+: RecModuleBuild buildC :=
   recBuildModuleWithLocalImports fun pkg mod leanFile contents importTargets => do
-    let importSharedLibTargets := importTargets.map (·.info.sharedLibTarget)
+    let mut cfg ← readThe ModuleBuildCfg
+    if !cfg.buildSharedLibs && pkg.config.precompileModules then
+      cfg := { cfg with buildSharedLibs := true }
+    let importTargets ← withReader (fun _ => cfg) importTargets
+    let importSharedLibTargets := importTargets.filterMap (·.info.sharedLibTarget?)
     let importTarget ← ActiveTarget.collectOpaqueList <| importTargets.map (·.info.oleanTarget) ++ importSharedLibTargets
     let loadLibs := importSharedLibTargets.map (·.info)
     let precompiledPath := (← getWorkspace).packageList.map (·.libDir)
     let allDepsTarget := Target.active <| ← depTarget.mixOpaqueAsync importTarget
-    let oleanAndC ← pkg.moduleOleanAndCTargetOnly mod leanFile contents loadLibs.toArray precompiledPath allDepsTarget
-    let oleanAndC ← oleanAndC.activate
-    let oTarget ← leanOFileTarget (pkg.modToO mod) (Target.active oleanAndC.cTarget) pkg.moreLeancArgs
-    let oTarget ← oTarget.activate
-    let loadLibs := Std.RBTree.ofList <| loadLibs.map (·.toString)
-    let moreLoadLibs :=
-      if System.Platform.isWindows then
-        -- we cannot have unresolved symbols on Windows, so we must pass the entire closure to the linker
-        importTargets.foldl (Std.RBTree.union · ·.info.allLoadLibs) {} |>.diff loadLibs
-      else
-        -- on other platforms, it is sufficient to link against the direct dependencies,
-        -- which when loaded will trigger loading the entire closure
-        {}
-    -- NOTE: we pass `moreLoadLibs` as direct arguments instead of targets,
-    -- which is okay because they are the closure of `importSharedLibTargets`
-    -- and so are already included in those traces
-    let linkArgs := moreLoadLibs.toArray ++ pkg.moreLinkArgs
-    let linkTargets := (oTarget :: importSharedLibTargets).toArray.map Target.active
-    let sharedLibTarget ← leanSharedLibTarget (pkg.modToSharedLib mod) linkTargets linkArgs
-    let sharedLibTarget ← sharedLibTarget.activate
-    let allLoadLibs := moreLoadLibs.union loadLibs
-    return sharedLibTarget.withInfo { oleanAndC.info with mod, sharedLibTarget, allLoadLibs }
-
-def recBuildModuleOleanAndCTargetWithLocalImports (depTarget : ActiveBuildTarget x)
-: RecModuleBuild ActiveOleanAndCTarget :=
-  recBuildModuleWithLocalImports fun pkg mod leanFile contents importTargets => do
-    let importTarget ← ActiveTarget.collectOpaqueList <| importTargets.map (·.oleanTarget)
-    let allDepsTarget := Target.active <| ← depTarget.mixOpaqueAsync importTarget
-    pkg.moduleOleanAndCTargetOnly mod leanFile contents #[] [] allDepsTarget |>.activate
-
-def recBuildModuleOleanTargetWithLocalImports (depTarget : ActiveBuildTarget x)
-: RecModuleBuild ActiveFileTarget :=
-  recBuildModuleWithLocalImports fun pkg mod leanFile contents importTargets => do
-    let importTarget ← ActiveTarget.collectOpaqueList importTargets
-    let allDepsTarget := Target.active <| ← depTarget.mixOpaqueAsync importTarget
-    pkg.moduleOleanTargetOnly mod leanFile contents allDepsTarget |>.activate
+    -- TODO: it looks like `do match` ignores `generalizing`
+    (match (generalizing := true) buildC, cfg.buildSharedLibs with
+    | false, false => do
+      let olean ← pkg.moduleOleanTargetOnly mod leanFile contents allDepsTarget |>.activate
+      return olean.withInfo { mod, leanOutputTarget := olean }
+    | true, false => do
+      let oleanAndC ← pkg.moduleOleanAndCTargetOnly mod leanFile contents loadLibs.toArray precompiledPath allDepsTarget |>.activate
+      return oleanAndC.withInfo { mod, leanOutputTarget := oleanAndC }
+    | buildC, true => do
+      let oleanAndC ← pkg.moduleOleanAndCTargetOnly mod leanFile contents loadLibs.toArray precompiledPath allDepsTarget |>.activate
+      let oTarget ← leanOFileTarget (pkg.modToO mod) (Target.active oleanAndC.cTarget) pkg.moreLeancArgs
+      let oTarget ← oTarget.activate
+      let loadLibs := Std.RBTree.ofList <| loadLibs.map (·.toString)
+      let moreLoadLibs :=
+        if System.Platform.isWindows then
+          -- we cannot have unresolved symbols on Windows, so we must pass the entire closure to the linker
+          importTargets.foldl (Std.RBTree.union · ·.info.allLoadLibs) {} |>.diff loadLibs
+        else
+          -- on other platforms, it is sufficient to link against the direct dependencies,
+          -- which when loaded will trigger loading the entire closure
+          {}
+      -- NOTE: we pass `moreLoadLibs` as direct arguments instead of targets,
+      -- which is okay because they are the closure of `importSharedLibTargets`
+      -- and so are already included in those traces
+      let linkArgs := moreLoadLibs.toArray ++ pkg.moreLinkArgs
+      let linkTargets := (oTarget :: importSharedLibTargets).toArray.map Target.active
+      let sharedLibTarget ← leanSharedLibTarget (pkg.modToSharedLib mod) linkTargets linkArgs
+      let sharedLibTarget ← sharedLibTarget.activate
+      let allLoadLibs := moreLoadLibs.union loadLibs
+      return sharedLibTarget.withInfo {
+        leanOutputTarget := match (generalizing := true) buildC with
+          | false => oleanAndC.oleanTarget
+          | true  => oleanAndC
+        sharedLibTarget? := sharedLibTarget
+        mod, allLoadLibs })
 
 -- ## Builders
 
 /-- Build a single module using the recursive module build function `build`. -/
-def buildModule (mod : ModuleInfo)
-[Inhabited o] (build : RecModuleBuild o) : BuildM o := do
-  failOnBuildCycle <| ← RBTopT.run' do
+def buildModule (mod : ModuleInfo) (build : RecModuleBuild buildC) : BuildM (ActiveModuleTarget buildC) := do
+  failOnBuildCycle <| ← ReaderT.run (r := {}) <| RBTopT.run' do
     buildRBTop (cmp := Name.quickCmp) build ModuleInfo.name mod
 
 /--
@@ -246,18 +266,18 @@ Build each module using the recursive module function `build`,
 constructing an `Array`  of the results.
 -/
 def buildModuleArray (mods : Array ModuleInfo)
-[Inhabited o] (build : RecModuleBuild o) : BuildM (Array o) := do
-  failOnBuildCycle <| ← RBTopT.run' <| mods.mapM <|
+(build : RecModuleBuild buildC) : BuildM (Array (ActiveModuleTarget buildC)) := do
+  failOnBuildCycle <| ← ReaderT.run (r := {}) <| RBTopT.run' <| mods.mapM <|
     buildRBTop (cmp := Name.quickCmp) build ModuleInfo.name
 
 /--
 Build each module using the recursive module function `build`,
 constructing a module-target `NameMap`  of the results.
 -/
-def buildModuleMap [Inhabited o]
-(infos : Array ModuleInfo) (build : RecModuleBuild o)
-: BuildM (NameMap o) := do
-  let (x, objMap) ← RBTopT.run do
+def buildModuleMap
+(infos : Array ModuleInfo) (build : RecModuleBuild buildC)
+: BuildM (NameMap (ActiveModuleTarget buildC)) := do
+  let (x, objMap) ← ReaderT.run (r := {}) <| RBTopT.run do
     infos.forM fun info => discard <| buildRBTop build ModuleInfo.name info
   failOnBuildCycle x
   return objMap

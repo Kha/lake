@@ -13,14 +13,16 @@ namespace Lake
 
 -- # Build Package .o Files
 
+abbrev ActiveModuleTargetWithC := ActiveModuleTarget (buildC := true)
+
 def Package.oFileTargetOf
-(mod : Name) (target : ActiveOleanAndCTarget) (self : Package) : FileTarget :=
+(mod : Name) (target : ActiveModuleTargetWithC) (self : Package) : FileTarget :=
   let oFile := self.modToO mod
-  let cTarget := Target.active <| ActiveOleanAndCTarget.cTarget target
+  let cTarget := Target.active <| target.info.leanOutputTarget.cTarget
   leanOFileTarget oFile cTarget self.moreLeancArgs
 
 def Package.oFileTargetsOf
-(targetMap : NameMap ActiveOleanAndCTarget) (self : Package) : Array FileTarget :=
+(targetMap : NameMap ActiveModuleTargetWithC) (self : Package) : Array FileTarget :=
   targetMap.fold (fun arr k v => arr.push (k, v)) #[] |>.filterMap fun (mod, target) =>
     if self.isLocalModule mod then self.oFileTargetOf mod target else none
 
@@ -33,8 +35,7 @@ def Package.moduleOTarget (mod : Name) (self : Package) : FileTarget :=
 
 protected def Package.staticLibTarget (self : Package) : FileTarget :=
  BuildTarget.mk' self.staticLibFile do
-    let moduleTargetMap ← self.buildModuleMap $
-      recBuildModuleOleanAndCTargetWithLocalImports
+    let moduleTargetMap ← self.buildModuleMap
     let oFileTargets := self.oFileTargetsOf moduleTargetMap
     staticLibTarget self.staticLibFile oFileTargets |>.materializeAsync
 
@@ -47,7 +48,7 @@ def Package.staticLibTargets (self : Package) : Array FileTarget :=
 -- # Build Package Shared Lib
 
 def Package.linkTargetsOf
-(targetMap : NameMap ActiveOleanAndCTarget) (self : Package) : LakeM (Array FileTarget) := do
+(targetMap : NameMap ActiveModuleTargetWithC) (self : Package) : LakeM (Array FileTarget) := do
   let collect dep recurse := do
       let pkg := (← getPackageByName? dep.name).get!
       let depTargets ← pkg.dependencies.concatMapM recurse
@@ -60,8 +61,7 @@ def Package.linkTargetsOf
 
 protected def Package.sharedLibTarget (self : Package) : FileTarget :=
   BuildTarget.mk' self.sharedLibFile do
-    let moduleTargetMap ← self.buildModuleMap $
-      recBuildModuleOleanAndCTargetWithLocalImports
+    let moduleTargetMap ← self.buildModuleMap
     let linkTargets ← self.linkTargetsOf moduleTargetMap
     let target := leanSharedLibTarget self.sharedLibFile linkTargets self.moreLinkArgs
     target.materializeAsync
@@ -75,7 +75,7 @@ protected def Package.binTarget (self : Package) : FileTarget :=
   BuildTarget.mk' self.binFile do
     let depTarget ← self.buildExtraDepsTarget
     let moduleTargetMap ← buildModuleMap #[⟨self, self.binRoot⟩] $
-      recBuildModuleOleanAndCTargetWithLocalImports depTarget
+      recBuildModuleTargetsWithLocalImports depTarget
     let pkgLinkTargets ← self.linkTargetsOf moduleTargetMap
     let linkTargets :=
       if self.isLocalModule self.binRoot then

@@ -38,48 +38,42 @@ def buildExtraDepsTarget : SchedulerM ActiveOpaqueTarget := do
 
 -- # Build Package Modules
 
+variable {buildC : Bool}
+
 /--
 Build the `extraDepTarget` of a package and its (transitive) dependencies
 and then build their modules recursively using the given `build` function,
 constructing a `NameMap` of the results.
 -/
-protected def Package.buildModuleMap [Inhabited o]
-(build : ActiveOpaqueTarget → RecModuleBuild o) (self : Package)
-: BuildM (NameMap o) := do
+protected def Package.buildModuleMap (self : Package)
+: BuildM (NameMap (ActiveModuleTarget buildC)) := do
   let depTarget ← self.buildExtraDepsTarget
   let infos := (← self.getModuleArray).map fun mod => ModuleInfo.mk self mod
-  buildModuleMap infos (build depTarget)
+  buildModuleMap infos (recBuildModuleTargetsWithLocalImports depTarget)
 
 /--
 Build the `extraDepTarget` of a package and its (transitive) dependencies
 and then build their modules recursively using the given `build` function,
 constructing a single opaque target for the whole build.
 -/
-def Package.buildTarget [Inhabited i]
-(build : ActiveOpaqueTarget → RecModuleTargetBuild i) (self : Package)
+def Package.buildTarget (self : Package) (buildC : Bool)
 : SchedulerM ActiveOpaqueTarget := do
   let depTarget ← self.buildExtraDepsTarget
   let buildMods : BuildM _ := do
     let mods ← self.getModuleArray
-    failOnBuildCycle <| ← RBTopT.run' do
+    failOnBuildCycle <| ← ReaderT.run (r := {}) <| RBTopT.run' do
       let targets ← mods.mapM fun mod => (·.withoutInfo) <$>
-        buildRBTop (build depTarget) ModuleInfo.name (ModuleInfo.mk self mod)
+        buildRBTop (recBuildModuleTargetsWithLocalImports (buildC := buildC) depTarget) ModuleInfo.name (ModuleInfo.mk self mod)
       ActiveTarget.collectOpaqueArray targets
   buildMods.catchFailure fun _ => pure <| ActiveTarget.opaque failure
 
 /-- Build the `.olean` files of package and its dependencies' modules. -/
 def Package.buildOleanTarget (self : Package) : SchedulerM ActiveOpaqueTarget := do
-  if self.config.precompileModules then
-    self.buildTarget recBuildModulePrecompTargetWithLocalImports
-  else
-    self.buildTarget recBuildModuleOleanTargetWithLocalImports
+  self.buildTarget (buildC := false)
 
 /-- Build the `.olean` and `.c` files of package and its dependencies' modules. -/
 def Package.buildOleanAndCTarget (self : Package) : SchedulerM ActiveOpaqueTarget := do
-  if self.config.precompileModules then
-    self.buildTarget recBuildModulePrecompTargetWithLocalImports
-  else
-    self.buildTarget recBuildModuleOleanAndCTargetWithLocalImports
+  self.buildTarget (buildC := true)
 
 def Package.buildDepOleans (self : Package) : BuildM PUnit := do
   let targets ← self.dependencies.mapM fun dep => do
@@ -97,22 +91,14 @@ def Package.build (self : Package) : BuildM PUnit := do
 def Package.moduleOleanTarget (mod : Name) (self : Package) : FileTarget :=
   BuildTarget.mk' (self.modToOlean mod) do
     let depTarget ← self.buildExtraDepsTarget
-    if self.config.precompileModules then
-      let build := recBuildModulePrecompTargetWithLocalImports depTarget
-      return (← buildModule ⟨self, mod⟩ build).task
-    else
-      let build := recBuildModuleOleanTargetWithLocalImports depTarget
-      return (← buildModule ⟨self, mod⟩ build).task
+    let build := recBuildModuleTargetsWithLocalImports depTarget
+    return (← buildModule (buildC := false) ⟨self, mod⟩ build).task
 
 def Package.moduleOleanAndCTarget (mod : Name) (self : Package) : OleanAndCTarget :=
   BuildTarget.mk' ⟨self.modToOlean mod, self.modToC mod⟩ do
     let depTarget ← self.buildExtraDepsTarget
-    if self.config.precompileModules then
-      let build := recBuildModulePrecompTargetWithLocalImports depTarget
-      return (← buildModule ⟨self, mod⟩ build).task
-    else
-      let build := recBuildModuleOleanAndCTargetWithLocalImports depTarget
-      return (← buildModule ⟨self, mod⟩ build).task
+    let build := recBuildModuleTargetsWithLocalImports depTarget
+    return (← buildModule (buildC := true) ⟨self, mod⟩ build).task
 
 -- # Build Imports
 
@@ -146,18 +132,8 @@ def Package.buildImportsAndDeps (imports : List String) (self : Package) : Build
   else
     -- build local imports from list
     let infos := (← getWorkspace).processImportList imports
-    if self.config.precompileModules then
-      let build := recBuildModulePrecompTargetWithLocalImports depTarget
-      let targets ← buildModuleArray infos build
-      let targets ← targets.mapM (·.build)
-      return targets.map (·.sharedLibTarget.info)
-    else if self.defaultFacet == PackageFacet.oleans then
-      let build := recBuildModuleOleanTargetWithLocalImports depTarget
-      let targets ← buildModuleArray infos build
-      targets.forM (·.buildOpaque)
-      return #[]
-    else
-      let build := recBuildModuleOleanAndCTargetWithLocalImports depTarget
-      let targets ← buildModuleArray infos build
-      targets.forM (·.buildOpaque)
-      return #[]
+    let buildC := self.defaultFacet != PackageFacet.oleans
+    let build := recBuildModuleTargetsWithLocalImports depTarget
+    let targets ← buildModuleArray (buildC := false) infos build
+    targets.forM (·.buildOpaque)
+    return #[]

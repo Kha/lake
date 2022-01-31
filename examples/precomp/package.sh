@@ -1,3 +1,3 @@
 set -ex
 
-(cd bar; ${LAKE:-../../../build/bin/lake} build)
+(cd baz; ${LAKE:-../../../build/bin/lake} build)
