@@ -181,24 +181,6 @@ abbrev ActiveModuleTarget (buildC : Bool) := ActiveBuildTarget (ActiveModuleTarg
 
 abbrev RecModuleBuild (buildC : Bool) := RecBuild ModuleInfo (ActiveModuleTarget buildC) (ModuleBuildM (ActiveModuleTarget buildC))
 
-/-
-Produces a recursive module target builder that
-builds the target module after recursively building its local imports
-(relative to the workspace).
--/
-def recBuildModuleWithLocalImports
-(build : Package → Name → FilePath → String → ModuleBuildM o (List o) → ModuleBuildM o o)
-: RecBuild ModuleInfo o (ModuleBuildM o) := fun info recurse => do
-  let contents ← IO.FS.readFile info.srcFile
-  let (imports, _, _) ← Elab.parseImports contents info.srcFile.toString
-  -- we construct the import targets even if a rebuild is not required
-  -- because other build processes (ex. `.o`) rely on the map being complete
-  let importTargets : ModuleBuildM o _ := imports.filterMapM fun imp => OptionT.run do
-    let mod := imp.module
-    let pkg ← OptionT.mk <| getPackageForModule? mod
-    recurse ⟨pkg, mod⟩
-  build info.pkg info.name info.srcFile contents importTargets
-
 variable {buildC : Bool}
 
 def ActiveModuleTargets.oleanTarget (self : ActiveModuleTargets buildC) : ActiveFileTarget :=
@@ -207,52 +189,59 @@ def ActiveModuleTargets.oleanTarget (self : ActiveModuleTargets buildC) : Active
   | false => self.leanOutputTarget
 
 def recBuildModuleTargetsWithLocalImports (depTarget : ActiveBuildTarget x)
-: RecModuleBuild buildC :=
-  recBuildModuleWithLocalImports fun pkg mod leanFile contents importTargets => do
-    let mut cfg ← readThe ModuleBuildCfg
-    if !cfg.buildSharedLibs && pkg.config.precompileModules then
-      cfg := { cfg with buildSharedLibs := true }
-    let importTargets ← withReader (fun _ => cfg) importTargets
-    let importSharedLibTargets := importTargets.filterMap (·.info.sharedLibTarget?)
-    let importTarget ← ActiveTarget.collectOpaqueList <| importTargets.map (·.info.oleanTarget) ++ importSharedLibTargets
-    let loadLibs := importSharedLibTargets.map (·.info)
-    let precompiledPath := (← getWorkspace).packageList.map (·.libDir)
-    let allDepsTarget := Target.active <| ← depTarget.mixOpaqueAsync importTarget
-    -- TODO: it looks like `do match` ignores `generalizing`
-    (match (generalizing := true) buildC, cfg.buildSharedLibs with
-    | false, false => do
-      let olean ← pkg.moduleOleanTargetOnly mod leanFile contents allDepsTarget |>.activate
-      return olean.withInfo { mod, leanOutputTarget := olean }
-    | true, false => do
-      let oleanAndC ← pkg.moduleOleanAndCTargetOnly mod leanFile contents loadLibs.toArray precompiledPath allDepsTarget |>.activate
-      return oleanAndC.withInfo { mod, leanOutputTarget := oleanAndC }
-    | buildC, true => do
-      let oleanAndC ← pkg.moduleOleanAndCTargetOnly mod leanFile contents loadLibs.toArray precompiledPath allDepsTarget |>.activate
-      let oTarget ← leanOFileTarget (pkg.modToO mod) (Target.active oleanAndC.cTarget) pkg.moreLeancArgs
-      let oTarget ← oTarget.activate
-      let loadLibs := Std.RBTree.ofList <| loadLibs.map (·.toString)
-      let moreLoadLibs :=
-        if System.Platform.isWindows then
-          -- we cannot have unresolved symbols on Windows, so we must pass the entire closure to the linker
-          importTargets.foldl (Std.RBTree.union · ·.info.allLoadLibs) {} |>.diff loadLibs
-        else
-          -- on other platforms, it is sufficient to link against the direct dependencies,
-          -- which when loaded will trigger loading the entire closure
-          {}
-      -- NOTE: we pass `moreLoadLibs` as direct arguments instead of targets,
-      -- which is okay because they are the closure of `importSharedLibTargets`
-      -- and so are already included in those traces
-      let linkArgs := moreLoadLibs.toArray ++ pkg.moreLinkArgs
-      let linkTargets := (oTarget :: importSharedLibTargets).toArray.map Target.active
-      let sharedLibTarget ← leanSharedLibTarget (pkg.modToSharedLib mod) linkTargets linkArgs
-      let sharedLibTarget ← sharedLibTarget.activate
-      let allLoadLibs := moreLoadLibs.union loadLibs
-      return sharedLibTarget.withInfo {
-        leanOutputTarget := match (generalizing := true) buildC with
-          | false => oleanAndC.oleanTarget
-          | true  => oleanAndC
-        sharedLibTarget? := sharedLibTarget
-        mod, allLoadLibs })
+: RecModuleBuild buildC := fun info@{ pkg, name := mod } recurse => do
+  let contents ← IO.FS.readFile info.srcFile
+  let (imports, _, _) ← Elab.parseImports contents info.srcFile.toString
+  let mut cfg ← readThe ModuleBuildCfg
+  if !cfg.buildSharedLibs && pkg.config.precompileModules then
+    cfg := { cfg with buildSharedLibs := true }
+  -- we construct the import targets even if a rebuild is not required
+  -- because other build processes (ex. `.o`) rely on the map being complete
+  let importTargets ← withReader (fun _ => cfg) do
+    imports.filterMapM fun imp => OptionT.run do
+      let mod := imp.module
+      let pkg ← OptionT.mk <| getPackageForModule? mod
+      recurse ⟨pkg, mod⟩
+  let importSharedLibTargets := importTargets.filterMap (·.info.sharedLibTarget?)
+  let importTarget ← ActiveTarget.collectOpaqueList <| importTargets.map (·.info.oleanTarget) ++ importSharedLibTargets
+  let loadLibs := importSharedLibTargets.map (·.info)
+  let precompiledPath := (← getWorkspace).packageList.map (·.libDir)
+  let allDepsTarget := Target.active <| ← depTarget.mixOpaqueAsync importTarget
+  -- TODO: it looks like `do match` ignores `generalizing`
+  (match (generalizing := true) buildC, cfg.buildSharedLibs with
+  | false, false => do
+    let olean ← pkg.moduleOleanTargetOnly mod info.srcFile contents allDepsTarget |>.activate
+    return olean.withInfo { mod, leanOutputTarget := olean }
+  | true, false => do
+    let oleanAndC ← pkg.moduleOleanAndCTargetOnly mod info.srcFile contents loadLibs.toArray precompiledPath allDepsTarget |>.activate
+    return oleanAndC.withInfo { mod, leanOutputTarget := oleanAndC }
+  | buildC, true => do
+    let oleanAndC ← pkg.moduleOleanAndCTargetOnly mod info.srcFile contents loadLibs.toArray precompiledPath allDepsTarget |>.activate
+    let oTarget ← leanOFileTarget (pkg.modToO mod) (Target.active oleanAndC.cTarget) pkg.moreLeancArgs
+    let oTarget ← oTarget.activate
+    let loadLibs := Std.RBTree.ofList <| loadLibs.map (·.toString)
+    let moreLoadLibs :=
+      if System.Platform.isWindows then
+        -- we cannot have unresolved symbols on Windows, so we must pass the entire closure to the linker
+        importTargets.foldl (Std.RBTree.union · ·.info.allLoadLibs) {} |>.diff loadLibs
+      else
+        -- on other platforms, it is sufficient to link against the direct dependencies,
+        -- which when loaded will trigger loading the entire closure
+        {}
+    -- NOTE: we pass `moreLoadLibs` as direct arguments instead of targets,
+    -- which is okay because they are the closure of `importSharedLibTargets`
+    -- and so are already included in those traces
+    let linkArgs := moreLoadLibs.toArray ++ pkg.moreLinkArgs
+    let linkTargets := (oTarget :: importSharedLibTargets).toArray.map Target.active
+    let sharedLibTarget ← leanSharedLibTarget (pkg.modToSharedLib mod) linkTargets linkArgs
+    let sharedLibTarget ← sharedLibTarget.activate
+    let allLoadLibs := moreLoadLibs.union loadLibs
+    return sharedLibTarget.withInfo {
+      leanOutputTarget := match (generalizing := true) buildC with
+        | false => oleanAndC.oleanTarget
+        | true  => oleanAndC
+      sharedLibTarget? := sharedLibTarget
+      mod, allLoadLibs })
 
 -- ## Builders
 
